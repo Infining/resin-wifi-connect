@@ -1,7 +1,7 @@
 use std::thread;
 use std::process;
 use std::time::Duration;
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::error::Error;
 use std::net::Ipv4Addr;
 
@@ -23,62 +23,86 @@ pub enum NetworkCommandResponse {
     AccessPointsSsids(Vec<String>),
 }
 
-#[cfg_attr(feature = "cargo-clippy", allow(cyclomatic_complexity))]
-pub fn process_network_commands(config: &Config, exit_tx: &Sender<ExitResult>) {
-    let manager = NetworkManager::new();
-    debug!("Network Manager connection initialized");
+struct NetworkCommandHandler {
+    manager: NetworkManager,
+    device: Device,
+    access_points: Vec<AccessPoint>,
+    portal_connection: Option<Connection>,
+    config: Config,
+    dnsmasq: process::Child,
+    server_tx: Sender<NetworkCommandResponse>,
+    network_rx: Receiver<NetworkCommand>,
+    activated: bool,
+}
 
-    let device = match find_device(&manager, &config.interface) {
-        Ok(device) => device,
-        Err(e) => {
-            return exit(exit_tx, e);
-        },
-    };
+impl NetworkCommandHandler {
+    fn new(config: &Config, exit_tx: &Sender<ExitResult>) -> Result<Self, String> {
+        let manager = NetworkManager::new();
+        debug!("NetworkManager connection initialized");
 
-    let mut access_points = match get_access_points(&device) {
-        Ok(access_points) => access_points,
-        Err(e) => {
-            return exit(exit_tx, format!("Getting access points failed: {}", e));
-        },
-    };
+        let device = find_device(&manager, &config.interface)?;
 
-    let portal_ssid = &config.ssid;
-    let portal_passphrase = config.passphrase.as_ref().map(|p| p as &str);
+        let access_points = get_access_points(&device)?;
 
-    let mut portal_connection =
-        match create_portal(&device, &config.ssid, &config.gateway, &portal_passphrase) {
-            Ok(connection) => Some(connection),
-            Err(e) => {
-                return exit(exit_tx, format!("Creating the access point failed: {}", e));
-            },
-        };
+        let portal_connection = Some(create_portal(&device, config)?);
 
-    let dnsmasq = start_dnsmasq(config, &device).unwrap();
+        let dnsmasq = start_dnsmasq(config, &device)?;
 
-    let (server_tx, server_rx) = channel();
-    let (network_tx, network_rx) = channel();
+        let (server_tx, server_rx) = channel();
+        let (network_tx, network_rx) = channel();
 
-    let exit_tx_server = exit_tx.clone();
-    let network_tx_timeout = network_tx.clone();
-    let gateway = config.gateway;
-    let ui_directory = config.ui_directory.clone();
-    let activity_timeout = config.activity_timeout;
+        Self::spawn_server(config, exit_tx, server_rx, network_tx.clone());
 
-    thread::spawn(move || {
-        start_server(
-            gateway,
-            server_rx,
-            network_tx,
-            exit_tx_server,
-            &ui_directory,
-        );
-    });
+        Self::spawn_activity_timeout(config, network_tx.clone());
 
-    if config.activity_timeout != 0 {
+        let config = config.clone();
+        let activated = false;
+
+        Ok(NetworkCommandHandler {
+            manager,
+            device,
+            access_points,
+            portal_connection,
+            config,
+            dnsmasq,
+            server_tx,
+            network_rx,
+            activated,
+        })
+    }
+
+    fn spawn_server(
+        config: &Config,
+        exit_tx: &Sender<ExitResult>,
+        server_rx: Receiver<NetworkCommandResponse>,
+        network_tx: Sender<NetworkCommand>,
+    ) {
+        let gateway = config.gateway;
+        let exit_tx_server = exit_tx.clone();
+        let ui_directory = config.ui_directory.clone();
+
+        thread::spawn(move || {
+            start_server(
+                gateway,
+                server_rx,
+                network_tx,
+                exit_tx_server,
+                &ui_directory,
+            );
+        });
+    }
+
+    fn spawn_activity_timeout(config: &Config, network_tx: Sender<NetworkCommand>) {
+        let activity_timeout = config.activity_timeout;
+
+        if activity_timeout == 0 {
+            return;
+        }
+
         thread::spawn(move || {
             thread::sleep(Duration::from_secs(activity_timeout));
 
-            if let Err(err) = network_tx_timeout.send(NetworkCommand::Timeout) {
+            if let Err(err) = network_tx.send(NetworkCommand::Timeout) {
                 error!(
                     "Sending NetworkCommand::Timeout failed: {}",
                     err.description()
@@ -87,158 +111,144 @@ pub fn process_network_commands(config: &Config, exit_tx: &Sender<ExitResult>) {
         });
     }
 
-    let mut activated = false;
+    fn run(&mut self, exit_tx: &Sender<ExitResult>) {
+        let result = self.run_loop();
+        self.stop(exit_tx, result);
+    }
 
-    loop {
-        let command = match network_rx.recv() {
-            Ok(command) => command,
+    fn run_loop(&mut self) -> ExitResult {
+        loop {
+            let command = self.receive_network_command()?;
+
+            match command {
+                NetworkCommand::Activate => {
+                    self.activate()?;
+                },
+                NetworkCommand::Timeout => {
+                    if !self.activated {
+                        info!("Timeout reached. Exiting...");
+                        return Ok(());
+                    }
+                },
+                NetworkCommand::Connect { ssid, passphrase } => {
+                    self.connect(&ssid, &passphrase)?;
+                },
+            }
+        }
+    }
+
+    fn receive_network_command(&self) -> Result<NetworkCommand, String> {
+        match self.network_rx.recv() {
+            Ok(command) => Ok(command),
             Err(e) => {
                 // Sleep for a second, so that other threads may log error info.
                 thread::sleep(Duration::from_secs(1));
-                return exit_with_error(
-                    exit_tx,
-                    dnsmasq,
-                    portal_connection,
-                    portal_ssid,
-                    format!("Receiving network command failed: {}", e.description()),
-                );
-            },
-        };
-
-        match command {
-            NetworkCommand::Activate => {
-                activated = true;
-
-                let access_points_ssids = get_access_points_ssids_owned(&access_points);
-
-                if let Err(e) = server_tx.send(NetworkCommandResponse::AccessPointsSsids(
-                    access_points_ssids,
-                )) {
-                    return exit_with_error(
-                        exit_tx,
-                        dnsmasq,
-                        portal_connection,
-                        portal_ssid,
-                        format!(
-                            "Sending access point ssids results failed: {}",
-                            e.description()
-                        ),
-                    );
-                }
-            },
-            NetworkCommand::Timeout => {
-                if !activated {
-                    info!("Timeout reached. Exiting...");
-
-                    return exit_ok(exit_tx, dnsmasq, portal_connection, portal_ssid);
-                }
-            },
-            NetworkCommand::Connect { ssid, passphrase } => {
-                if let Some(connection) = portal_connection {
-                    let result = stop_portal(&connection, &config.ssid);
-                    if let Err(e) = result {
-                        return exit_with_error(
-                            exit_tx,
-                            dnsmasq,
-                            Some(connection),
-                            portal_ssid,
-                            format!("Stopping the access point failed: {}", e),
-                        );
-                    }
-                    portal_connection = None;
-                }
-
-                access_points = match get_access_points(&device) {
-                    Ok(access_points) => access_points,
-                    Err(e) => {
-                        return exit_with_error(
-                            exit_tx,
-                            dnsmasq,
-                            portal_connection,
-                            portal_ssid,
-                            format!("Getting access points failed: {}", e),
-                        );
-                    },
-                };
-
-                {
-                    let (access_point, access_point_ssid) =
-                        find_access_point(&access_points, &ssid).unwrap();
-
-                    let wifi_device = device.as_wifi_device().unwrap();
-
-                    info!("Connecting to access point '{}'...", access_point_ssid);
-
-                    match wifi_device.connect(access_point, &passphrase as &str) {
-                        Ok((connection, state)) => {
-                            if state == ConnectionState::Activated {
-                                match wait_for_connectivity(&manager, 20) {
-                                    Ok(has_connectivity) => {
-                                        if has_connectivity {
-                                            info!("Connectivity established");
-
-                                            return exit_ok(
-                                                exit_tx,
-                                                dnsmasq,
-                                                portal_connection,
-                                                portal_ssid,
-                                            );
-                                        } else {
-                                            warn!("Cannot establish connectivity");
-                                        }
-                                    },
-                                    Err(err) => error!("Getting connectivity failed: {}", err),
-                                }
-                            }
-
-                            if let Err(err) = connection.delete() {
-                                error!("Deleting connection object failed: {}", err)
-                            }
-
-                            warn!(
-                                "Connection to access point not activated '{}': {:?}",
-                                access_point_ssid, state
-                            );
-                        },
-                        Err(e) => {
-                            warn!(
-                                "Error connecting to access point '{}': {}",
-                                access_point_ssid, e
-                            );
-                        },
-                    }
-                }
-
-                access_points = match get_access_points(&device) {
-                    Ok(access_points) => access_points,
-                    Err(e) => {
-                        return exit_with_error(
-                            exit_tx,
-                            dnsmasq,
-                            portal_connection,
-                            portal_ssid,
-                            format!("Getting access points failed: {}", e),
-                        );
-                    },
-                };
-
-                portal_connection =
-                    match create_portal(&device, &config.ssid, &config.gateway, &portal_passphrase)
-                    {
-                        Ok(connection) => Some(connection),
-                        Err(e) => {
-                            return exit_with_error(
-                                exit_tx,
-                                dnsmasq,
-                                portal_connection,
-                                portal_ssid,
-                                format!("Creating the access point failed: {}", e),
-                            );
-                        },
-                    };
+                Err(format!(
+                    "Receiving network command failed: {}",
+                    e.description()
+                ))
             },
         }
     }
+
+    fn stop(&mut self, exit_tx: &Sender<ExitResult>, result: ExitResult) {
+        let _ = self.dnsmasq.kill();
+
+        if let Some(ref connection) = self.portal_connection {
+            let _ = stop_portal_impl(connection, &self.config);
+        }
+
+        let _ = exit_tx.send(result);
+    }
+
+    fn activate(&mut self) -> ExitResult {
+        self.activated = true;
+
+        let access_points_ssids = get_access_points_ssids_owned(&self.access_points);
+
+        if let Err(e) = self.server_tx
+            .send(NetworkCommandResponse::AccessPointsSsids(
+                access_points_ssids,
+            )) {
+            return Err(format!(
+                "Sending access point ssids results failed: {}",
+                e.description()
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn connect(&mut self, ssid: &str, passphrase: &str) -> ExitResult {
+        if let Some(ref connection) = self.portal_connection {
+            stop_portal(connection, &self.config)?;
+        }
+
+        self.portal_connection = None;
+
+        self.access_points = get_access_points(&self.device)?;
+
+        if let Some((access_point, access_point_ssid)) =
+            find_access_point(&self.access_points, ssid)
+        {
+            let wifi_device = self.device.as_wifi_device().unwrap();
+
+            info!("Connecting to access point '{}'...", access_point_ssid);
+
+            match wifi_device.connect(access_point, passphrase) {
+                Ok((connection, state)) => {
+                    if state == ConnectionState::Activated {
+                        match wait_for_connectivity(&self.manager, 20) {
+                            Ok(has_connectivity) => {
+                                if has_connectivity {
+                                    info!("Connectivity established");
+
+                                    return Ok(());
+                                } else {
+                                    warn!("Cannot establish connectivity");
+                                }
+                            },
+                            Err(err) => error!("Getting connectivity failed: {}", err),
+                        }
+                    }
+
+                    if let Err(err) = connection.delete() {
+                        error!("Deleting connection object failed: {}", err)
+                    }
+
+                    warn!(
+                        "Connection to access point not activated '{}': {:?}",
+                        access_point_ssid, state
+                    );
+                },
+                Err(e) => {
+                    warn!(
+                        "Error connecting to access point '{}': {}",
+                        access_point_ssid, e
+                    );
+                },
+            }
+        }
+
+        self.access_points = get_access_points(&self.device)?;
+
+        self.portal_connection = Some(create_portal(&self.device, &self.config)?);
+
+        Ok(())
+    }
+}
+
+#[cfg_attr(feature = "cargo-clippy", allow(cyclomatic_complexity))]
+pub fn process_network_commands(config: &Config, exit_tx: &Sender<ExitResult>) {
+    let mut command_handler = match NetworkCommandHandler::new(config, exit_tx) {
+        Ok(command_handler) => command_handler,
+        Err(e) => {
+            exit(exit_tx, e);
+            return;
+        },
+    };
+
+    command_handler.run(exit_tx);
 }
 
 pub fn init_networking() {
@@ -277,6 +287,10 @@ pub fn find_device(manager: &NetworkManager, interface: &Option<String>) -> Resu
 }
 
 fn get_access_points(device: &Device) -> Result<Vec<AccessPoint>, String> {
+    get_access_points_impl(device).map_err(|e| format!("Getting access points failed: {}", e))
+}
+
+fn get_access_points_impl(device: &Device) -> Result<Vec<AccessPoint>, String> {
     let retries_allowed = 10;
     let mut retries = 0;
 
@@ -334,7 +348,14 @@ fn find_access_point<'a>(
     None
 }
 
-fn create_portal(
+fn create_portal(device: &Device, config: &Config) -> Result<Connection, String> {
+    let portal_passphrase = config.passphrase.as_ref().map(|p| p as &str);
+
+    create_portal_impl(device, &config.ssid, &config.gateway, &portal_passphrase)
+        .map_err(|e| format!("Creating the captive portal failed: {}", e))
+}
+
+fn create_portal_impl(
     device: &Device,
     ssid: &str,
     gateway: &Ipv4Addr,
@@ -347,48 +368,18 @@ fn create_portal(
     Ok(portal_connection)
 }
 
-fn stop_portal(connection: &Connection, ssid: &str) -> Result<(), String> {
-    info!("Stopping access point '{}'...", ssid);
+fn stop_portal(connection: &Connection, config: &Config) -> Result<(), String> {
+    stop_portal_impl(connection, config)
+        .map_err(|e| format!("Stopping the access point failed: {}", e))
+}
+
+fn stop_portal_impl(connection: &Connection, config: &Config) -> Result<(), String> {
+    info!("Stopping access point '{}'...", config.ssid);
     connection.deactivate()?;
     connection.delete()?;
     thread::sleep(Duration::from_secs(1));
-    info!("Access point '{}' stopped", ssid);
+    info!("Access point '{}' stopped", config.ssid);
     Ok(())
-}
-
-fn exit_with_error(
-    exit_tx: &Sender<ExitResult>,
-    dnsmasq: process::Child,
-    connection: Option<Connection>,
-    ssid: &str,
-    error: String,
-) {
-    exit_with_result(exit_tx, dnsmasq, connection, ssid, Err(error));
-}
-
-fn exit_ok(
-    exit_tx: &Sender<ExitResult>,
-    dnsmasq: process::Child,
-    connection: Option<Connection>,
-    ssid: &str,
-) {
-    exit_with_result(exit_tx, dnsmasq, connection, ssid, Ok(()));
-}
-
-fn exit_with_result(
-    exit_tx: &Sender<ExitResult>,
-    mut dnsmasq: process::Child,
-    connection: Option<Connection>,
-    ssid: &str,
-    result: ExitResult,
-) {
-    let _ = dnsmasq.kill();
-
-    if let Some(connection) = connection {
-        let _ = stop_portal(&connection, ssid);
-    }
-
-    let _ = exit_tx.send(result);
 }
 
 fn wait_for_connectivity(manager: &NetworkManager, timeout: u64) -> Result<bool, String> {

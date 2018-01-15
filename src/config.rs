@@ -12,6 +12,7 @@ const DEFAULT_SSID: &str = "WiFi Connect";
 const DEFAULT_ACTIVITY_TIMEOUT: &str = "0";
 const DEFAULT_UI_DIRECTORY: &str = "ui";
 
+#[derive(Clone)]
 pub struct Config {
     pub interface: Option<String>,
     pub ssid: String,
