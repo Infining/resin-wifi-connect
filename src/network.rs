@@ -131,7 +131,9 @@ impl NetworkCommandHandler {
                     }
                 },
                 NetworkCommand::Connect { ssid, passphrase } => {
-                    self.connect(&ssid, &passphrase)?;
+                    if self.connect(&ssid, &passphrase)? {
+                        return Ok(());
+                    }
                 },
             }
         }
@@ -179,7 +181,9 @@ impl NetworkCommandHandler {
         Ok(())
     }
 
-    fn connect(&mut self, ssid: &str, passphrase: &str) -> ExitResult {
+    fn connect(&mut self, ssid: &str, passphrase: &str) -> Result<bool, String> {
+        delete_connection_if_exists(&self.manager, ssid);
+
         if let Some(ref connection) = self.portal_connection {
             stop_portal(connection, &self.config)?;
         }
@@ -188,12 +192,10 @@ impl NetworkCommandHandler {
 
         self.access_points = get_access_points(&self.device)?;
 
-        if let Some((access_point, access_point_ssid)) =
-            find_access_point(&self.access_points, ssid)
-        {
+        if let Some(access_point) = find_access_point(&self.access_points, ssid) {
             let wifi_device = self.device.as_wifi_device().unwrap();
 
-            info!("Connecting to access point '{}'...", access_point_ssid);
+            info!("Connecting to access point '{}'...", ssid);
 
             match wifi_device.connect(access_point, passphrase) {
                 Ok((connection, state)) => {
@@ -203,7 +205,7 @@ impl NetworkCommandHandler {
                                 if has_connectivity {
                                     info!("Connectivity established");
 
-                                    return Ok(());
+                                    return Ok(true);
                                 } else {
                                     warn!("Cannot establish connectivity");
                                 }
@@ -218,14 +220,11 @@ impl NetworkCommandHandler {
 
                     warn!(
                         "Connection to access point not activated '{}': {:?}",
-                        access_point_ssid, state
+                        ssid, state
                     );
                 },
                 Err(e) => {
-                    warn!(
-                        "Error connecting to access point '{}': {}",
-                        access_point_ssid, e
-                    );
+                    warn!("Error connecting to access point '{}': {}", ssid, e);
                 },
             }
         }
@@ -234,7 +233,7 @@ impl NetworkCommandHandler {
 
         self.portal_connection = Some(create_portal(&self.device, &self.config)?);
 
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -333,14 +332,11 @@ fn get_access_points_ssids_owned(access_points: &[AccessPoint]) -> Vec<String> {
         .collect()
 }
 
-fn find_access_point<'a>(
-    access_points: &'a [AccessPoint],
-    ssid: &str,
-) -> Option<(&'a AccessPoint, &'a str)> {
+fn find_access_point<'a>(access_points: &'a [AccessPoint], ssid: &str) -> Option<&'a AccessPoint> {
     for access_point in access_points.iter() {
         if let Ok(access_point_ssid) = access_point.ssid().as_str() {
             if access_point_ssid == ssid {
-                return Some((access_point, access_point_ssid));
+                return Some(access_point);
             }
         }
     }
@@ -466,4 +462,29 @@ fn stop_access_point() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn delete_connection_if_exists(manager: &NetworkManager, ssid: &str) {
+    let connections = match manager.get_connections() {
+        Ok(connections) => connections,
+        Err(e) => {
+            error!("Getting existing connections failed: {}", e);
+            return;
+        },
+    };
+
+    for connection in connections {
+        if let Ok(connection_ssid) = connection.settings().ssid.as_str() {
+            if &connection.settings().kind == "802-11-wireless" && connection_ssid == ssid {
+                info!(
+                    "Deleting existing WiFi connection: {:?}",
+                    connection.settings().ssid,
+                );
+
+                if let Err(e) = connection.delete() {
+                    error!("Deleting existing WiFi connection failed: {}", e);
+                }
+            }
+        }
+    }
 }
