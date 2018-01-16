@@ -253,7 +253,7 @@ pub fn process_network_commands(config: &Config, exit_tx: &Sender<ExitResult>) {
 pub fn init_networking() {
     start_network_manager_service();
 
-    if let Err(err) = stop_access_point() {
+    if let Err(err) = delete_access_point_profiles() {
         error!("Stopping access point failed: {}", err);
         process::exit(1);
     }
@@ -446,15 +446,15 @@ pub fn start_network_manager_service() {
     }
 }
 
-fn stop_access_point() -> Result<(), String> {
+fn delete_access_point_profiles() -> Result<(), String> {
     let manager = NetworkManager::new();
 
-    let connections = manager.get_active_connections()?;
+    let connections = manager.get_connections()?;
 
     for connection in connections {
         if &connection.settings().kind == "802-11-wireless" && &connection.settings().mode == "ap" {
             debug!(
-                "Deleting active access point connection profile to {:?}",
+                "Deleting access point connection profile: {:?}",
                 connection.settings().ssid,
             );
             connection.delete()?;
