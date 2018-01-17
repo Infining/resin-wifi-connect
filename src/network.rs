@@ -203,15 +203,15 @@ impl NetworkCommandHandler {
                         match wait_for_connectivity(&self.manager, 20) {
                             Ok(has_connectivity) => {
                                 if has_connectivity {
-                                    info!("Connectivity established");
-
-                                    return Ok(true);
+                                    info!("Internet connectivity established");
                                 } else {
-                                    warn!("Cannot establish connectivity");
+                                    warn!("Cannot establish Internet connectivity");
                                 }
                             },
-                            Err(err) => error!("Getting connectivity failed: {}", err),
+                            Err(err) => error!("Getting Internet connectivity failed: {}", err),
                         }
+
+                        return Ok(true);
                     }
 
                     if let Err(err) = connection.delete() {
