@@ -33,7 +33,7 @@ WiFi Connect detects available WiFi networks and opens an access point with a ca
 
 ### 2. Connect: User Connects Phone to Device Access Point
 
-Connect to the opened access point on the device from your mobile phone or laptop. The access point SSID is, by default, `WiFi Connect`. It can be changed by setting the `--portal-ssid` command line argument or the `PORTAL_SSID` environment variable (see [this guide](https://docs.resin.io/management/env-vars/) for how to manage environment variables). By default, the network is unprotected, but a WPA2 passphrase can be added by setting the `--portal-ssid` command line argument or `PORTAL_PASSPHRASE` environment variable.
+Connect to the opened access point on the device from your mobile phone or laptop. The access point SSID is, by default, `WiFi Connect`. It can be changed by setting the `--portal-ssid` command line argument or the `PORTAL_SSID` environment variable (see [this guide](https://docs.resin.io/management/env-vars/) for how to manage environment variables when running on top of resinOS). By default, the network is unprotected, but a WPA2 passphrase can be added by setting the `--portal-passphrase` command line argument or the `PORTAL_PASSPHRASE` environment variable.
 
 ### 3. Portal: Phone Shows Captive Portal to User
 
@@ -41,7 +41,7 @@ After connecting to the access point from a mobile phone, it will detect the cap
 
 ### 4. Credentials: User Enters Local WiFi Network Credentials on Phone
 
-The captive portal provides the option to select a WiFi SSID and enter a passphrase for the desired network.
+The captive portal provides the option to select a WiFi SSID from a list with detected WiFi networks and enter a passphrase for the desired network.
 
 ### 5. Connected!: Device Connects to Local WiFi Network
 

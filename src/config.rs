@@ -33,7 +33,7 @@ pub fn get_config() -> Config {
                 .short("i")
                 .long("portal-interface")
                 .value_name("interface")
-                .help("Portal interface")
+                .help("Wireless network interface to be used by WiFi Connect")
                 .takes_value(true),
         )
         .arg(
@@ -41,7 +41,10 @@ pub fn get_config() -> Config {
                 .short("s")
                 .long("portal-ssid")
                 .value_name("ssid")
-                .help("Portal SSID")
+                .help(&format!(
+                    "SSID of the captive portal WiFi network (default: {})",
+                    DEFAULT_SSID
+                ))
                 .takes_value(true),
         )
         .arg(
@@ -49,7 +52,7 @@ pub fn get_config() -> Config {
                 .short("p")
                 .long("portal-passphrase")
                 .value_name("passphrase")
-                .help("Portal passphrase")
+                .help("WPA2 Passphrase of the captive portal WiFi network (default: none)")
                 .takes_value(true),
         )
         .arg(
@@ -57,7 +60,10 @@ pub fn get_config() -> Config {
                 .short("g")
                 .long("portal-gateway")
                 .value_name("gateway")
-                .help("Portal gateway")
+                .help(&format!(
+                    "Gateway of the captive portal WiFi network (default: {})",
+                    DEFAULT_GATEWAY
+                ))
                 .takes_value(true),
         )
         .arg(
@@ -65,7 +71,10 @@ pub fn get_config() -> Config {
                 .short("d")
                 .long("portal-dhcp-range")
                 .value_name("dhcp_range")
-                .help("Portal DHCP range")
+                .help(&format!(
+                    "DHCP range of the WiFi network (default: {})",
+                    DEFAULT_DHCP_RANGE
+                ))
                 .takes_value(true),
         )
         .arg(
@@ -73,7 +82,7 @@ pub fn get_config() -> Config {
                 .short("a")
                 .long("activity-timeout")
                 .value_name("activity_timeout")
-                .help("Activity timeout (seconds) (default: 0 - no timeout)")
+                .help("Exit if no activity for the specified time (seconds) (default: none)")
                 .takes_value(true),
         )
         .arg(
@@ -81,7 +90,10 @@ pub fn get_config() -> Config {
                 .short("u")
                 .long("ui-directory")
                 .value_name("ui_directory")
-                .help("Web UI directory location")
+                .help(&format!(
+                    "Web UI directory location (default: {})",
+                    DEFAULT_UI_DIRECTORY
+                ))
                 .takes_value(true),
         )
         .get_matches();
